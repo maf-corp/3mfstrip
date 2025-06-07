@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import logging
+import sys
+import xml.etree.ElementTree as ET
+from datetime import date
+from io import BytesIO
+from os.path import basename
+from typing import Optional, Union, Set
+from zipfile import ZipFile, ZIP_DEFLATED, ZipInfo
+
+logger = logging.getLogger(__name__)
+
+ET.register_namespace('', 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02')
+ET.register_namespace('p', 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06')
+ET.register_namespace('BambuStudio', 'http://schemas.bambulab.com/package/2021')
+
+NS = {
+    'm': 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02',
+    'p': 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06',
+    'BambuStudio': 'http://schemas.bambulab.com/package/2021'
+}
+
+EMPTY_ELEMENT = '\n'
+
+
+def configure_logging(verbosity: int = 0):
+    level = logging.WARNING
+
+    if verbosity == 1:
+        level = logging.INFO
+    elif verbosity >= 2:
+        level = logging.DEBUG
+
+    logging.basicConfig(level=level, format='%(levelname)s: %(message)s')
+
+
+def update_element_text(root: ET.Element, xpath: str, text: Optional[str] = None, ns: Optional[dict] = None) -> None:
+    el = root.find(xpath, namespaces=ns)
+    if el is not None:
+        logger.debug("Updating XPath('%s') from %r to %r", xpath, el.text, text)
+        el.text = text or EMPTY_ELEMENT
+    else:
+        logger.warning("Could not find XPath('%s')", xpath)
+
+
+def update_object_text(obj: any, jpath: str, text: Optional[str] = None) -> None:
+    if jpath in obj:
+        logger.debug("Updating JPath('%s') from %r to %r", jpath, obj[jpath], text)
+        obj[jpath] = text or ""
+    else:
+        logger.warning("Could not find JPath('%s')", jpath)
+
+
+def strip_model_settings(zr: ZipFile, zw: ZipFile, strip_zip: bool = True, keep_filename: bool = False) -> str:
+    logger.info("Stripping model path...")
+    model_settings = zr.read("Metadata/model_settings.config")
+    tree = ET.ElementTree(ET.fromstring(model_settings))
+    root = tree.getroot()
+
+    for source_file in root.findall("./config/part/metadata[@key='source_file']"):
+        source_file.text = basename(source_file.text) if keep_filename else EMPTY_ELEMENT
+
+    buf = BytesIO()
+    tree.write(buf, encoding="utf-8", method="xml", xml_declaration=True)
+    zip_write(zw, "Metadata/model_settings.config", buf.getvalue(), strip_zip)
+    return "Metadata/model_settings.config"
+
+
+def strip_project_settings(zr: ZipFile, zw: ZipFile, strip_zip: bool = True) -> str:
+    logger.info("Stripping project settings...")
+    project_settings = zr.read("Metadata/project_settings.config")
+    obj = json.loads(project_settings)
+    if "version" in obj:
+        obj["version"] = ""
+
+    project_settings = json.dumps(obj, indent=4).encode("utf-8")
+    zip_write(zw, "Metadata/project_settings.config", project_settings, strip_zip)
+    return "Metadata/project_settings.config"
+
+
+def strip_slice_info(zr: ZipFile, zw: ZipFile, strip_zip: bool = True) -> str:
+    logger.info("Stripping slice info version...")
+    slice_info = zr.read("Metadata/slice_info.config")
+    tree = ET.ElementTree(ET.fromstring(slice_info))
+    root = tree.getroot()
+    update_element_text(root, ".//header_item[@key='X-BBL-Client-Version']")
+
+    buf = BytesIO()
+    tree.write(buf, encoding="utf-8", method="xml", xml_declaration=True)
+    zip_write(zw, "Metadata/slice_info.config", buf.getvalue(), strip_zip)
+    return "Metadata/slice_info.config"
+
+
+def strip_model(zr: ZipFile, zw: ZipFile, strip_zip: bool = True, strip_designer: bool = True,
+                strip_creation_date: Union[bool, date] = True,
+                strip_modification_date: Union[bool, date] = True, strip_application_version: bool = True) -> str:
+    logger.info("Stripping model metadata...")
+    model = zr.read("3D/3dmodel.model")
+    tree = ET.ElementTree(ET.fromstring(model))
+
+    root = tree.getroot()
+
+    if strip_designer:
+        for tag in ["Designer", "DesignerUserId", "DesignerCover"]:
+            update_element_text(root, f".//m:metadata[@name='{tag}']", ns=NS)
+
+    if strip_creation_date:
+        text = strip_creation_date.strftime('%Y-%m-%d') if isinstance(strip_creation_date, date) else EMPTY_ELEMENT
+        update_element_text(root, ".//m:metadata[@name='CreationDate']", text, ns=NS)
+
+    if strip_modification_date:
+        text = strip_modification_date.strftime('%Y-%m-%d') if isinstance(strip_modification_date,
+                                                                          date) else EMPTY_ELEMENT
+        update_element_text(root, ".//m:metadata[@name='ModificationDate']", text, ns=NS)
+
+    if strip_application_version:
+        update_element_text(root, ".//m:metadata[@name='Application']", ns=NS)
+
+    buf = BytesIO()
+    tree.write(buf, encoding="utf-8", method="xml", xml_declaration=True)
+    zip_write(zw, "3D/3dmodel.model", buf.getvalue(), strip_zip)
+    return "3D/3dmodel.model"
+
+
+def strip(zr: ZipFile, zw: ZipFile, strip_zip: bool = True, *, strip_designer=True, strip_model_path=True,
+          keep_model_filename=True,
+          strip_creation_date=True, strip_modification_date=True, strip_application_version=False) -> Set[str]:
+    modified = set()
+    if strip_model_path:
+        modified.add(strip_model_settings(zr, zw, strip_zip, keep_model_filename))
+    if strip_application_version:
+        modified.add(strip_project_settings(zr, zw, strip_zip))
+        modified.add(strip_slice_info(zr, zw, strip_zip))
+
+    if strip_designer or strip_creation_date or strip_modification_date or strip_application_version:
+        modified.add(strip_model(zr, zw, strip_zip, strip_designer, strip_creation_date, strip_modification_date,
+                                 strip_application_version))
+
+    return modified
+
+
+def zip_write(zw: ZipFile, name: str, data: any, strip_zip: bool = True):
+    info = ZipInfo(name)
+
+    if strip_zip:
+        info.compress_type = ZIP_DEFLATED
+        info.date_time = (1980, 1, 1, 0, 0, 0)  # cook time fingerprinting
+        info.create_system = 0  # everyone is now Windows
+        info.comment = (  # add comment noise
+            "aHR0cHM6Ly9jYnNhdXN0aW4uY29tL25ld3MvbG9jYWwvM"
+            "2QtZ3VuLXByaW50aW5nLWNvbXBhbnktZm91bmRlci1jb2"
+            "R5LXdpbHNvbi1nZXRzLTcteWVhcnMtcHJvYmF0aW9uLWZ"
+            "vci1zZXgtd2l0aC1taW5vci1jYXNl").encode("utf-8")
+
+    zw.writestr(info, data)
+
+
+def get_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Strip private metadata from BambuStudio 3MF files.",
+    )
+    parser.add_argument("input", metavar="INPUT", help="input .3mf file")
+    parser.add_argument("output", metavar="OUTPUT", help="putput .3mf file")
+
+    parser.add_argument("-D", "--keep-designer", dest="strip_designer", action="store_false", help="keep designer info")
+    parser.add_argument("-P", "--keep-model-path", dest="strip_model_path", action="store_false",
+                        help="keep model path info")
+    parser.add_argument("-N", "--keep-model-name", dest="keep_model_filename", action="store_false",
+                        help="strip full path, not just filename")
+    parser.add_argument("-C", "--keep-create-date", dest="strip_creation_date", action="store_false",
+                        help="keep creation date")
+    parser.add_argument("-M", "--keep-modify-date", dest="strip_modification_date", action="store_false",
+                        help="keep modification date")
+    parser.add_argument("-a", "--strip-app-version", dest="strip_application_version", action="store_true",
+                        help="strip application version")
+
+    parser.add_argument("-Z", "--no-strip-zip", dest="strip_zip", action="store_false",
+                        help="disable ZIP metadata sanitization")
+
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="increase output verbosity"
+    )
+
+    return parser
+
+
+def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
+    return get_parser().parse_args(args or sys.argv[1:])
+
+
+def main(args: Optional[list[str]] = None) -> None:
+    opts = parse_args(args)
+    configure_logging(opts.verbose)
+
+    logger.info(f"Stripping metadata from {opts.input} to {opts.output}")
+
+    with ZipFile(opts.input, 'r') as zr, ZipFile(opts.output, 'w', compression=ZIP_DEFLATED) as zw:
+        modified_files = strip(
+            zr, zw,
+            strip_designer=opts.strip_designer,
+            strip_model_path=opts.strip_model_path,
+            keep_model_filename=opts.keep_model_filename,
+            strip_creation_date=opts.strip_creation_date,
+            strip_modification_date=opts.strip_modification_date,
+            strip_application_version=opts.strip_application_version,
+        )
+
+        for item in zr.infolist():
+            if item.filename not in modified_files:
+                zip_write(zw, item.filename, zr.read(item.filename), strip_zip=opts.strip_zip)
+
+
+if __name__ == "__main__":
+    main()
