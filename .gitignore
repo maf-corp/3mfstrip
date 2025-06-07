@@ -1,6 +1,6 @@
 ## Unwanted examples
 # Analysis of the 3MF internals
-examples/internals
+examples/internals*
 
 ## Keys
 *-key
